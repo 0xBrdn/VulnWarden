@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from vulnwarden import __version__
+from vulnwarden.sarif_parser import parse_sarif
 
 app = typer.Typer(
     name="vulnwarden",
@@ -69,8 +70,26 @@ def triage(
     if output:
         _print_info(f"Output will be written to: {output}")
 
-    # Placeholder for future implementation
-    _print_warning("Triage engine not yet implemented. Coming in next steps.")
+    try:
+        findings = parse_sarif(sarif_file)
+    except FileNotFoundError as exc:
+        _print_error(str(exc))
+        raise typer.Exit(code=1)
+    except ValueError as exc:
+        _print_error(f"SARIF parsing error: {exc}")
+        raise typer.Exit(code=1)
+    except OSError as exc:
+        _print_error(f"I/O error while reading SARIF: {exc}")
+        raise typer.Exit(code=1)
+
+    count = len(findings)
+    if count == 0:
+        _print_warning("No findings extracted from the SARIF file")
+    else:
+        _print_success(f"Extracted {count} finding(s) from SARIF")
+
+    # Placeholder for LLM triage / remediation (next steps)
+    _print_warning("LLM triage engine not yet implemented. Coming in next steps.")
     raise typer.Exit(code=0)
 
 
