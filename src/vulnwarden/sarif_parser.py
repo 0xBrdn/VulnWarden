@@ -1,4 +1,8 @@
-"""SARIF 2.1.0 parser for vulnerability findings extraction."""
+"""SARIF 2.1.0 parser for vulnerability findings extraction.
+
+Supports both standard camelCase (Semgrep, Trivy, etc.) and
+snake_case (SecretHound) field names.
+"""
 
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ class ContextLine(BaseModel):
 class SarifFinding(BaseModel):
     """Strict model representing a single vulnerability finding extracted from SARIF."""
 
-    rule_id: str = Field(..., min_length=1, description="Rule identifier (ruleId)")
+    rule_id: str = Field(..., min_length=1, description="Rule identifier (ruleId / rule_id)")
     message: str = Field(..., min_length=1, description="Human-readable error / finding message")
     file_path: str = Field(..., min_length=1, description="URI / path of the target file")
     start_line: int = Field(..., ge=1, description="1-based start line of the finding")
@@ -41,9 +45,19 @@ class SarifFinding(BaseModel):
         return cleaned
 
 
+def _get(d: dict[str, Any], *candidates: str, default: Any = None) -> Any:
+    """
+    Return the first present key among the candidates (supports camelCase + snake_case).
+    """
+    for key in candidates:
+        if key in d and d[key] is not None:
+            return d[key]
+    return default
+
+
 def _extract_message(result: dict[str, Any]) -> str:
     """Extract the primary message text from a SARIF result object."""
-    message = result.get("message")
+    message = _get(result, "message")
     if message is None:
         return "No message provided"
 
@@ -51,10 +65,10 @@ def _extract_message(result: dict[str, Any]) -> str:
         return message.strip() or "No message provided"
 
     if isinstance(message, dict):
-        text = message.get("text")
+        text = _get(message, "text")
         if isinstance(text, str) and text.strip():
             return text.strip()
-        md = message.get("markdown")
+        md = _get(message, "markdown")
         if isinstance(md, str) and md.strip():
             return md.strip()
 
@@ -63,33 +77,47 @@ def _extract_message(result: dict[str, Any]) -> str:
 
 def _extract_location(result: dict[str, Any]) -> tuple[str, int]:
     """
-    Strict extraction following the exact SARIF 2.1.0 paths used by SecretHound:
+    Extract file URI and startLine.
 
-      ruleId   -> handled by caller
-      file     -> result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
-      line     -> result["locations"][0]["physicalLocation"]["region"]["startLine"]
+    Accepts both conventions:
+      - Standard SARIF 2.1.0 (camelCase):
+          locations[0].physicalLocation.artifactLocation.uri
+          locations[0].physicalLocation.region.startLine
+      - SecretHound (snake_case):
+          locations[0].physical_location.artifact_location.uri
+          locations[0].physical_location.region.start_line
 
-    Returns (file_path, start_line). Falls back to ("unknown", 1) only when
-    the expected keys are genuinely missing.
+    Returns (file_path, start_line). Falls back to ("unknown", 1) when keys are missing.
     """
     try:
-        locations = result["locations"]
+        locations = _get(result, "locations")
         if not isinstance(locations, list) or len(locations) == 0:
             return ("unknown", 1)
 
-        physical = locations[0]["physicalLocation"]
-        uri = physical["artifactLocation"]["uri"]
-        start_line = physical["region"]["startLine"]
+        loc = locations[0]
+        if not isinstance(loc, dict):
+            return ("unknown", 1)
 
+        physical = _get(loc, "physicalLocation", "physical_location")
+        if not isinstance(physical, dict):
+            return ("unknown", 1)
+
+        artifact = _get(physical, "artifactLocation", "artifact_location")
+        if not isinstance(artifact, dict):
+            return ("unknown", 1)
+
+        uri = _get(artifact, "uri")
         if not isinstance(uri, str) or not uri.strip():
             return ("unknown", 1)
 
-        if not isinstance(start_line, int) or start_line < 1:
-            # Some tools emit the line as a string
-            if isinstance(start_line, str) and start_line.isdigit():
-                start_line = int(start_line)
-            else:
-                start_line = 1
+        region = _get(physical, "region")
+        start_line = 1
+        if isinstance(region, dict):
+            sl = _get(region, "startLine", "start_line")
+            if isinstance(sl, int) and sl >= 1:
+                start_line = sl
+            elif isinstance(sl, str) and sl.isdigit():
+                start_line = max(1, int(sl))
 
         return (uri.strip(), start_line)
 
@@ -112,7 +140,7 @@ def _extract_context(
 
     cleaned = file_path.strip()
 
-    # Strip file:// scheme if present (common in some SARIF producers)
+    # Strip file:// scheme if present
     if cleaned.startswith("file://"):
         cleaned = cleaned[7:]
 
@@ -154,8 +182,9 @@ def parse_sarif(sarif_path: Path) -> list[SarifFinding]:
     """
     Parse a SARIF 2.1.0 file and return a list of SarifFinding.
 
-    Compatible with outputs from SecretHound, Semgrep, Trivy and other
-    SARIF producers that follow the 2.1.0 schema for results.
+    Compatible with:
+    - Standard camelCase producers (Semgrep, Trivy, CodeQL, ...)
+    - snake_case producers (SecretHound)
     """
     if not sarif_path.is_file():
         raise FileNotFoundError(f"SARIF file not found: {sarif_path}")
@@ -189,8 +218,18 @@ def parse_sarif(sarif_path: Path) -> list[SarifFinding]:
             if not isinstance(result, dict):
                 continue
 
-            # Strict extraction of ruleId (exact field used by SecretHound)
-            rule_id = result.get("ruleId")
+            # Accept both ruleId (standard) and rule_id (SecretHound)
+            rule_id = _get(result, "ruleId", "rule_id")
+            if not isinstance(rule_id, str) or not rule_id.strip():
+                # Last-chance fallback for nested rule object
+                rule_obj = _get(result, "rule")
+                if isinstance(rule_obj, dict):
+                    rule_id = _get(rule_obj, "id")
+                elif isinstance(rule_obj, str):
+                    rule_id = rule_obj
+                else:
+                    rule_id = None
+
             if not isinstance(rule_id, str) or not rule_id.strip():
                 rule_id = "unknown"
             else:
