@@ -54,7 +54,6 @@ def _extract_message(result: dict[str, Any]) -> str:
         text = message.get("text")
         if isinstance(text, str) and text.strip():
             return text.strip()
-        # Fallback to markdown if present
         md = message.get("markdown")
         if isinstance(md, str) and md.strip():
             return md.strip()
@@ -62,70 +61,40 @@ def _extract_message(result: dict[str, Any]) -> str:
     return "No message provided"
 
 
-def _safe_get(d: Any, *keys: str, default: Any = None) -> Any:
-    """Safely traverse nested dicts without raising."""
-    cur = d
-    for key in keys:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(key, default)
-        if cur is default:
-            return default
-    return cur
-
-
 def _extract_location(result: dict[str, Any]) -> tuple[str, int]:
     """
-    Extract file URI and startLine from the first physicalLocation.
+    Strict extraction following the exact SARIF 2.1.0 paths used by SecretHound:
 
-    Follows the SARIF 2.1.0 standard path used by SecretHound, Semgrep, Trivy:
-      result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
-      result["locations"][0]["physicalLocation"]["region"]["startLine"]
+      ruleId   -> handled by caller
+      file     -> result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+      line     -> result["locations"][0]["physicalLocation"]["region"]["startLine"]
 
-    Returns (file_path, start_line). Falls back to ("unknown", 1).
+    Returns (file_path, start_line). Falls back to ("unknown", 1) only when
+    the expected keys are genuinely missing.
     """
-    locations = result.get("locations")
-    if not isinstance(locations, list) or not locations:
+    try:
+        locations = result["locations"]
+        if not isinstance(locations, list) or len(locations) == 0:
+            return ("unknown", 1)
+
+        physical = locations[0]["physicalLocation"]
+        uri = physical["artifactLocation"]["uri"]
+        start_line = physical["region"]["startLine"]
+
+        if not isinstance(uri, str) or not uri.strip():
+            return ("unknown", 1)
+
+        if not isinstance(start_line, int) or start_line < 1:
+            # Some tools emit the line as a string
+            if isinstance(start_line, str) and start_line.isdigit():
+                start_line = int(start_line)
+            else:
+                start_line = 1
+
+        return (uri.strip(), start_line)
+
+    except (KeyError, TypeError, IndexError, AttributeError):
         return ("unknown", 1)
-
-    loc = locations[0]
-    if not isinstance(loc, dict):
-        return ("unknown", 1)
-
-    # Standard path
-    physical = loc.get("physicalLocation")
-    if not isinstance(physical, dict):
-        # Some producers put artifactLocation directly under the location object
-        physical = loc
-
-    artifact = physical.get("artifactLocation") if isinstance(physical, dict) else None
-    uri = "unknown"
-    if isinstance(artifact, dict):
-        raw_uri = artifact.get("uri")
-        if isinstance(raw_uri, str) and raw_uri.strip():
-            uri = raw_uri.strip()
-        else:
-            # Fallback sometimes seen
-            raw_uri = artifact.get("uriBaseId")
-            if isinstance(raw_uri, str) and raw_uri.strip():
-                uri = raw_uri.strip()
-
-    # Also try the very common alternative where uri lives one level higher
-    if uri == "unknown":
-        alt = _safe_get(loc, "physicalLocation", "address", "uri")
-        if isinstance(alt, str) and alt.strip():
-            uri = alt.strip()
-
-    region = physical.get("region") if isinstance(physical, dict) else None
-    start_line = 1
-    if isinstance(region, dict):
-        sl = region.get("startLine")
-        if isinstance(sl, int) and sl >= 1:
-            start_line = sl
-        elif isinstance(sl, str) and sl.isdigit():
-            start_line = max(1, int(sl))
-
-    return (uri, start_line)
 
 
 def _extract_context(
@@ -141,24 +110,22 @@ def _extract_context(
     if not file_path or file_path == "unknown":
         return ([], False)
 
-    # Normalize common URI forms produced by SecretHound / Semgrep / etc.
     cleaned = file_path.strip()
+
+    # Strip file:// scheme if present (common in some SARIF producers)
     if cleaned.startswith("file://"):
-        cleaned = cleaned[7:]          # strip scheme
-        if cleaned.startswith("//"):
-            cleaned = cleaned[1:]      # file://// -> rare, normalize lightly
+        cleaned = cleaned[7:]
 
     path = Path(cleaned)
 
-    # Relative paths are resolved against the current working directory
-    if not path.is_file() and not path.is_absolute():
-        path = Path.cwd() / cleaned
+    # Resolve relative paths against the current working directory
+    if not path.is_absolute():
+        path = Path.cwd() / path
 
     if not path.is_file():
         return ([], False)
 
     try:
-        # Read with universal newlines and preserve original content
         text = path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
     except OSError:
@@ -168,9 +135,8 @@ def _extract_context(
     if total == 0:
         return ([], False)
 
-    # Clamp the window
-    start_idx = max(0, start_line - 1 - before)  # 0-based
-    end_idx = min(total, start_line + after)     # exclusive
+    start_idx = max(0, start_line - 1 - before)
+    end_idx = min(total, start_line + after)
 
     context: list[ContextLine] = []
     for idx in range(start_idx, end_idx):
@@ -215,7 +181,7 @@ def parse_sarif(sarif_path: Path) -> list[SarifFinding]:
         if not isinstance(run, dict):
             continue
 
-        results = run.get("results") or []
+        results = run.get("results")
         if not isinstance(results, list):
             continue
 
@@ -223,18 +189,8 @@ def parse_sarif(sarif_path: Path) -> list[SarifFinding]:
             if not isinstance(result, dict):
                 continue
 
-            # Prefer the standard SARIF field used by SecretHound / Semgrep / Trivy
+            # Strict extraction of ruleId (exact field used by SecretHound)
             rule_id = result.get("ruleId")
-            if not isinstance(rule_id, str) or not rule_id.strip():
-                # Fallback: some tools nest it under "rule"
-                rule_obj = result.get("rule")
-                if isinstance(rule_obj, dict):
-                    rule_id = rule_obj.get("id")
-                elif isinstance(rule_obj, str):
-                    rule_id = rule_obj
-                else:
-                    rule_id = None
-
             if not isinstance(rule_id, str) or not rule_id.strip():
                 rule_id = "unknown"
             else:
@@ -242,7 +198,6 @@ def parse_sarif(sarif_path: Path) -> list[SarifFinding]:
 
             message = _extract_message(result)
             file_path, start_line = _extract_location(result)
-
             context, available = _extract_context(file_path, start_line)
 
             try:
