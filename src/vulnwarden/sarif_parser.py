@@ -62,31 +62,61 @@ def _extract_message(result: dict[str, Any]) -> str:
     return "No message provided"
 
 
+def _safe_get(d: Any, *keys: str, default: Any = None) -> Any:
+    """Safely traverse nested dicts without raising."""
+    cur = d
+    for key in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key, default)
+        if cur is default:
+            return default
+    return cur
+
+
 def _extract_location(result: dict[str, Any]) -> tuple[str, int]:
     """
     Extract file URI and startLine from the first physicalLocation.
-    Returns (file_path, start_line). Falls back to sensible defaults.
+
+    Follows the SARIF 2.1.0 standard path used by SecretHound, Semgrep, Trivy:
+      result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+      result["locations"][0]["physicalLocation"]["region"]["startLine"]
+
+    Returns (file_path, start_line). Falls back to ("unknown", 1).
     """
-    locations = result.get("locations") or []
-    if not locations:
+    locations = result.get("locations")
+    if not isinstance(locations, list) or not locations:
         return ("unknown", 1)
 
     loc = locations[0]
     if not isinstance(loc, dict):
         return ("unknown", 1)
 
-    physical = loc.get("physicalLocation") or {}
+    # Standard path
+    physical = loc.get("physicalLocation")
     if not isinstance(physical, dict):
-        return ("unknown", 1)
+        # Some producers put artifactLocation directly under the location object
+        physical = loc
 
-    artifact = physical.get("artifactLocation") or {}
+    artifact = physical.get("artifactLocation") if isinstance(physical, dict) else None
     uri = "unknown"
     if isinstance(artifact, dict):
-        raw_uri = artifact.get("uri") or artifact.get("uriBaseId") or ""
+        raw_uri = artifact.get("uri")
         if isinstance(raw_uri, str) and raw_uri.strip():
             uri = raw_uri.strip()
+        else:
+            # Fallback sometimes seen
+            raw_uri = artifact.get("uriBaseId")
+            if isinstance(raw_uri, str) and raw_uri.strip():
+                uri = raw_uri.strip()
 
-    region = physical.get("region") or {}
+    # Also try the very common alternative where uri lives one level higher
+    if uri == "unknown":
+        alt = _safe_get(loc, "physicalLocation", "address", "uri")
+        if isinstance(alt, str) and alt.strip():
+            uri = alt.strip()
+
+    region = physical.get("region") if isinstance(physical, dict) else None
     start_line = 1
     if isinstance(region, dict):
         sl = region.get("startLine")
@@ -108,14 +138,21 @@ def _extract_context(
     Attempt to read the source file and return a context window.
     Returns (list of ContextLine, success_flag).
     """
-    path = Path(file_path)
+    if not file_path or file_path == "unknown":
+        return ([], False)
 
-    # Handle common URI prefixes (file://, relative paths, etc.)
-    if file_path.startswith("file://"):
-        path = Path(file_path[7:])
-    elif file_path.startswith("./") or not path.is_absolute():
-        # Keep relative as-is; caller is expected to run from project root
-        path = Path(file_path)
+    # Normalize common URI forms produced by SecretHound / Semgrep / etc.
+    cleaned = file_path.strip()
+    if cleaned.startswith("file://"):
+        cleaned = cleaned[7:]          # strip scheme
+        if cleaned.startswith("//"):
+            cleaned = cleaned[1:]      # file://// -> rare, normalize lightly
+
+    path = Path(cleaned)
+
+    # Relative paths are resolved against the current working directory
+    if not path.is_file() and not path.is_absolute():
+        path = Path.cwd() / cleaned
 
     if not path.is_file():
         return ([], False)
@@ -186,9 +223,22 @@ def parse_sarif(sarif_path: Path) -> list[SarifFinding]:
             if not isinstance(result, dict):
                 continue
 
-            rule_id = result.get("ruleId") or result.get("rule", {}).get("id") or "unknown"
+            # Prefer the standard SARIF field used by SecretHound / Semgrep / Trivy
+            rule_id = result.get("ruleId")
+            if not isinstance(rule_id, str) or not rule_id.strip():
+                # Fallback: some tools nest it under "rule"
+                rule_obj = result.get("rule")
+                if isinstance(rule_obj, dict):
+                    rule_id = rule_obj.get("id")
+                elif isinstance(rule_obj, str):
+                    rule_id = rule_obj
+                else:
+                    rule_id = None
+
             if not isinstance(rule_id, str) or not rule_id.strip():
                 rule_id = "unknown"
+            else:
+                rule_id = rule_id.strip()
 
             message = _extract_message(result)
             file_path, start_line = _extract_location(result)

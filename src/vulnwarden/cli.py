@@ -9,6 +9,14 @@ from rich.console import Console
 from rich.panel import Panel
 
 from vulnwarden import __version__
+from vulnwarden.ai_engine import TriageResult, triage_finding
+from vulnwarden.reporter import (
+    create_progress,
+    generate_markdown_report,
+    has_true_positives,
+    print_summary_table,
+    print_true_positive_details,
+)
 from vulnwarden.sarif_parser import parse_sarif
 
 app = typer.Typer(
@@ -59,7 +67,7 @@ def triage(
         None,
         "--output",
         "-o",
-        help="Optional path to write the triage report (JSON or Markdown).",
+        help="Optional path to write a Markdown audit report (ready for PR).",
     ),
 ) -> None:
     """Triage vulnerabilities from a SARIF report using a local LLM."""
@@ -68,8 +76,11 @@ def triage(
     _print_info(f"Using model: {model}")
 
     if output:
-        _print_info(f"Output will be written to: {output}")
+        _print_info(f"Markdown report will be written to: {output}")
 
+    # ------------------------------------------------------------------
+    # 1. Parse SARIF
+    # ------------------------------------------------------------------
     try:
         findings = parse_sarif(sarif_file)
     except FileNotFoundError as exc:
@@ -85,11 +96,64 @@ def triage(
     count = len(findings)
     if count == 0:
         _print_warning("No findings extracted from the SARIF file")
-    else:
-        _print_success(f"Extracted {count} finding(s) from SARIF")
+        raise typer.Exit(code=0)
 
-    # Placeholder for LLM triage / remediation (next steps)
-    _print_warning("LLM triage engine not yet implemented. Coming in next steps.")
+    _print_success(f"Extracted {count} finding(s) from SARIF")
+    console.print()
+
+    # ------------------------------------------------------------------
+    # 2. AI triage with progress bar
+    # ------------------------------------------------------------------
+    results: list[tuple] = []
+
+    with create_progress() as progress:
+        task_id = progress.add_task("Analysing findings...", total=count)
+
+        for idx, finding in enumerate(findings, 1):
+            short_loc = f"{Path(finding.file_path).name}:{finding.start_line}"
+            progress.update(
+                task_id,
+                description=f"Analysing [{idx}/{count}] {short_loc}",
+            )
+
+            try:
+                result = triage_finding(finding, model=model)
+                results.append((finding, result))
+            except (ConnectionError, TimeoutError, ValueError, RuntimeError) as exc:
+                results.append((finding, exc))
+                _print_warning(f"Failed on {short_loc}: {exc}")
+
+            progress.advance(task_id)
+
+    # ------------------------------------------------------------------
+    # 3. Terminal report
+    # ------------------------------------------------------------------
+    print_summary_table(results)
+    print_true_positive_details(results)
+
+    # ------------------------------------------------------------------
+    # 4. Optional Markdown report
+    # ------------------------------------------------------------------
+    if output is not None:
+        try:
+            generate_markdown_report(
+                results,
+                output,
+                model=model,
+                sarif_file=sarif_file,
+            )
+            _print_success(f"Markdown audit report written to: {output}")
+        except OSError as exc:
+            _print_error(f"Could not write report: {exc}")
+
+    # ------------------------------------------------------------------
+    # 5. Exit code
+    # ------------------------------------------------------------------
+    if has_true_positives(results):
+        _print_error("One or more TRUE_POSITIVE findings remain – action required")
+        raise typer.Exit(code=1)
+
+    _print_success("No true positives remaining – clean triage")
     raise typer.Exit(code=0)
 
 
@@ -109,7 +173,6 @@ def check_health(
 
     try:
         with httpx.Client(timeout=5.0) as client:
-            # Check server reachability
             response = client.get(f"{OLLAMA_BASE_URL}/api/tags")
             response.raise_for_status()
             data = response.json()
@@ -132,7 +195,6 @@ def check_health(
     models = data.get("models", [])
     model_names = [m.get("name", "") for m in models]
 
-    # Ollama model names can be exact or with :latest
     available = False
     matched_name = None
     for name in model_names:
@@ -140,7 +202,6 @@ def check_health(
             available = True
             matched_name = name
             break
-        # Also match without tag
         base = name.split(":")[0]
         if base == model.split(":")[0]:
             available = True
